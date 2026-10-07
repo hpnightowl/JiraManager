@@ -1,93 +1,119 @@
+use crate::db;
+use crate::error::AppError;
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 use tauri::State;
 
 /// One task in the list. `Serialize` lets serde turn it into JSON for the UI.
 #[derive(Debug, Clone, Serialize)]
 pub struct Task {
-    pub id: u64,
+    pub id: i64,
     pub title: String,
     pub done: bool,
 }
 
-/// The data we guard with a lock.
-#[derive(Default)]
-struct Inner {
-    next_id: u64,
-    tasks: Vec<Task>,
+/// Task storage backed by a SQLite file.
+/// A `rusqlite::Connection` can't be used from two threads at once,
+/// so we keep it behind a `Mutex` (same idea as milestone 2).
+pub struct TaskStore {
+    conn: Mutex<Connection>,
 }
 
-/// App-wide task storage (in memory for now; SQLite arrives in milestone 3).
-/// `Mutex` makes it safe when several commands run on different threads.
-#[derive(Default)]
-pub struct TaskStore {
-    inner: Mutex<Inner>,
+fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
+    Ok(Task {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        done: row.get(2)?, // SQLite stores 0/1, rusqlite converts to bool
+    })
+}
+
+fn get(conn: &Connection, id: i64) -> Result<Task, AppError> {
+    conn.query_row(
+        "SELECT id, title, done FROM tasks WHERE id = ?1",
+        params![id],
+        row_to_task,
+    )
+    .optional()? // "no row" becomes None instead of an error
+    .ok_or(AppError::NotFound(id))
 }
 
 impl TaskStore {
-    pub fn add(&self, title: &str) -> Result<Task, String> {
+    /// Open (or create) the database file and bring its schema up to date.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, AppError> {
+        Self::from_connection(Connection::open(path)?)
+    }
+
+    fn from_connection(mut conn: Connection) -> Result<Self, AppError> {
+        db::migrate(&mut conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn conn(&self) -> Result<MutexGuard<'_, Connection>, AppError> {
+        self.conn.lock().map_err(|_| AppError::Poisoned)
+    }
+
+    pub fn add(&self, title: &str) -> Result<Task, AppError> {
         let title = title.trim();
         if title.is_empty() {
-            return Err("Task title can't be empty".into());
+            return Err(AppError::Invalid("Task title can't be empty".into()));
         }
-        let mut inner = self.inner.lock().map_err(|_| "task store is poisoned")?;
-        inner.next_id += 1;
-        let task = Task {
-            id: inner.next_id,
-            title: title.to_string(),
-            done: false,
-        };
-        inner.tasks.push(task.clone());
-        Ok(task)
+        let conn = self.conn()?;
+        // `?1` is a bound parameter: never build SQL by pasting user text into it.
+        conn.execute("INSERT INTO tasks (title) VALUES (?1)", params![title])?;
+        get(&conn, conn.last_insert_rowid())
     }
 
-    pub fn list(&self) -> Result<Vec<Task>, String> {
-        let inner = self.inner.lock().map_err(|_| "task store is poisoned")?;
-        Ok(inner.tasks.clone())
+    pub fn list(&self) -> Result<Vec<Task>, AppError> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare("SELECT id, title, done FROM tasks ORDER BY id")?;
+        let tasks = stmt
+            .query_map([], row_to_task)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(tasks)
     }
 
-    pub fn toggle(&self, id: u64) -> Result<Task, String> {
-        let mut inner = self.inner.lock().map_err(|_| "task store is poisoned")?;
-        let task = inner
-            .tasks
-            .iter_mut()
-            .find(|t| t.id == id)
-            .ok_or_else(|| format!("No task with id {id}"))?;
-        task.done = !task.done;
-        Ok(task.clone())
+    pub fn toggle(&self, id: i64) -> Result<Task, AppError> {
+        let conn = self.conn()?;
+        let changed = conn.execute("UPDATE tasks SET done = 1 - done WHERE id = ?1", params![id])?;
+        if changed == 0 {
+            return Err(AppError::NotFound(id));
+        }
+        get(&conn, id)
     }
 
-    pub fn remove(&self, id: u64) -> Result<(), String> {
-        let mut inner = self.inner.lock().map_err(|_| "task store is poisoned")?;
-        let before = inner.tasks.len();
-        inner.tasks.retain(|t| t.id != id);
-        if inner.tasks.len() == before {
-            return Err(format!("No task with id {id}"));
+    pub fn remove(&self, id: i64) -> Result<(), AppError> {
+        let conn = self.conn()?;
+        let changed = conn.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
+        if changed == 0 {
+            return Err(AppError::NotFound(id));
         }
         Ok(())
     }
 }
 
-// --- Tauri commands: thin wrappers the UI can `invoke(...)` ---------------
-// `State<TaskStore>` is how Tauri hands us the store registered with `.manage()`.
+// --- Tauri commands: unchanged shape from milestone 2, only the error type differs ---
 
 #[tauri::command]
-pub fn add_task(title: String, store: State<'_, TaskStore>) -> Result<Task, String> {
+pub fn add_task(title: String, store: State<'_, TaskStore>) -> Result<Task, AppError> {
     store.add(&title)
 }
 
 #[tauri::command]
-pub fn list_tasks(store: State<'_, TaskStore>) -> Result<Vec<Task>, String> {
+pub fn list_tasks(store: State<'_, TaskStore>) -> Result<Vec<Task>, AppError> {
     store.list()
 }
 
 #[tauri::command]
-pub fn toggle_task(id: u64, store: State<'_, TaskStore>) -> Result<Task, String> {
+pub fn toggle_task(id: i64, store: State<'_, TaskStore>) -> Result<Task, AppError> {
     store.toggle(id)
 }
 
 #[tauri::command]
-pub fn delete_task(id: u64, store: State<'_, TaskStore>) -> Result<(), String> {
+pub fn delete_task(id: i64, store: State<'_, TaskStore>) -> Result<(), AppError> {
     store.remove(id)
 }
 
@@ -95,38 +121,66 @@ pub fn delete_task(id: u64, store: State<'_, TaskStore>) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn store() -> TaskStore {
+        TaskStore::from_connection(Connection::open_in_memory().unwrap()).unwrap()
+    }
+
     #[test]
     fn add_trims_and_assigns_increasing_ids() {
-        let store = TaskStore::default();
+        let store = store();
         let a = store.add("  fix login  ").unwrap();
         let b = store.add("write tests").unwrap();
         assert_eq!(a.title, "fix login");
-        assert_eq!((a.id, b.id), (1, 2));
+        assert!(b.id > a.id);
         assert_eq!(store.list().unwrap().len(), 2);
     }
 
     #[test]
     fn add_rejects_blank_title() {
-        let store = TaskStore::default();
-        assert!(store.add("   ").is_err());
+        let store = store();
+        assert!(matches!(store.add("   "), Err(AppError::Invalid(_))));
         assert!(store.list().unwrap().is_empty());
     }
 
     #[test]
     fn toggle_flips_done_and_unknown_id_errors() {
-        let store = TaskStore::default();
+        let store = store();
         let t = store.add("x").unwrap();
         assert!(store.toggle(t.id).unwrap().done);
         assert!(!store.toggle(t.id).unwrap().done);
-        assert!(store.toggle(999).is_err());
+        assert!(matches!(store.toggle(999), Err(AppError::NotFound(999))));
     }
 
     #[test]
     fn remove_deletes_and_unknown_id_errors() {
-        let store = TaskStore::default();
+        let store = store();
         let t = store.add("x").unwrap();
         store.remove(t.id).unwrap();
         assert!(store.list().unwrap().is_empty());
-        assert!(store.remove(t.id).is_err());
+        assert!(matches!(store.remove(t.id), Err(AppError::NotFound(_))));
+    }
+
+    #[test]
+    fn data_survives_reopening_the_file() {
+        let path = std::env::temp_dir().join(format!("projectjira-test-{}.db", std::process::id()));
+        {
+            let store = TaskStore::open(&path).unwrap();
+            store.add("persist me").unwrap();
+        } // store dropped here -> file closed
+        let reopened = TaskStore::open(&path).unwrap();
+        let tasks = reopened.list().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "persist me");
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn titles_with_sql_characters_are_stored_literally() {
+        let store = store();
+        let nasty = "x'); DROP TABLE tasks; --";
+        let t = store.add(nasty).unwrap();
+        assert_eq!(t.title, nasty);
+        assert_eq!(store.list().unwrap().len(), 1);
     }
 }
