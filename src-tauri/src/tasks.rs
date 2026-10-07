@@ -12,6 +12,10 @@ pub struct Task {
     pub id: i64,
     pub title: String,
     pub done: bool,
+    /// Seconds from FINISHED time entries. The UI adds the live part itself.
+    pub tracked_seconds: i64,
+    /// Unix time the currently running timer started; `None` = not running.
+    pub running_since: Option<i64>,
 }
 
 /// Task storage backed by a SQLite file.
@@ -21,17 +25,26 @@ pub struct TaskStore {
     conn: Mutex<Connection>,
 }
 
+/// Tasks plus their time totals in one query: a LEFT JOIN keeps tasks that have no
+/// time entries yet, and GROUP BY folds each task's entries into one row.
+const TASK_SELECT: &str = "SELECT t.id, t.title, t.done,
+        COALESCE(SUM(CASE WHEN e.ended_at IS NOT NULL THEN e.ended_at - e.started_at END), 0),
+        MAX(CASE WHEN e.ended_at IS NULL THEN e.started_at END)
+    FROM tasks t LEFT JOIN time_entries e ON e.task_id = t.id";
+
 fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
         id: row.get(0)?,
         title: row.get(1)?,
         done: row.get(2)?, // SQLite stores 0/1, rusqlite converts to bool
+        tracked_seconds: row.get(3)?,
+        running_since: row.get(4)?, // NULL becomes None
     })
 }
 
 fn get(conn: &Connection, id: i64) -> Result<Task, AppError> {
     conn.query_row(
-        "SELECT id, title, done FROM tasks WHERE id = ?1",
+        &format!("{TASK_SELECT} WHERE t.id = ?1 GROUP BY t.id"),
         params![id],
         row_to_task,
     )
@@ -45,14 +58,17 @@ impl TaskStore {
         Self::from_connection(Connection::open(path)?)
     }
 
-    fn from_connection(mut conn: Connection) -> Result<Self, AppError> {
+    pub(crate) fn from_connection(mut conn: Connection) -> Result<Self, AppError> {
+        // SQLite ignores FOREIGN KEY rules unless you switch them on for each connection.
+        conn.pragma_update(None, "foreign_keys", true)?;
         db::migrate(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    fn conn(&self) -> Result<MutexGuard<'_, Connection>, AppError> {
+    /// `pub(crate)` = visible to other modules of this app (like `timer.rs`), not outside it.
+    pub(crate) fn conn(&self) -> Result<MutexGuard<'_, Connection>, AppError> {
         self.conn.lock().map_err(|_| AppError::Poisoned)
     }
 
@@ -69,7 +85,7 @@ impl TaskStore {
 
     pub fn list(&self) -> Result<Vec<Task>, AppError> {
         let conn = self.conn()?;
-        let mut stmt = conn.prepare("SELECT id, title, done FROM tasks ORDER BY id")?;
+        let mut stmt = conn.prepare(&format!("{TASK_SELECT} GROUP BY t.id ORDER BY t.id"))?;
         let tasks = stmt
             .query_map([], row_to_task)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -87,15 +103,21 @@ impl TaskStore {
 
     pub fn remove(&self, id: i64) -> Result<(), AppError> {
         let conn = self.conn()?;
+        // Its time entries go too: `ON DELETE CASCADE` in the schema.
         let changed = conn.execute("DELETE FROM tasks WHERE id = ?1", params![id])?;
         if changed == 0 {
             return Err(AppError::NotFound(id));
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Self {
+        Self::from_connection(Connection::open_in_memory().unwrap()).unwrap()
+    }
 }
 
-// --- Tauri commands: unchanged shape from milestone 2, only the error type differs ---
+// --- Tauri commands -------------------------------------------------------------------
 
 #[tauri::command]
 pub fn add_task(title: String, store: State<'_, TaskStore>) -> Result<Task, AppError> {
@@ -121,13 +143,9 @@ pub fn delete_task(id: i64, store: State<'_, TaskStore>) -> Result<(), AppError>
 mod tests {
     use super::*;
 
-    fn store() -> TaskStore {
-        TaskStore::from_connection(Connection::open_in_memory().unwrap()).unwrap()
-    }
-
     #[test]
     fn add_trims_and_assigns_increasing_ids() {
-        let store = store();
+        let store = TaskStore::in_memory();
         let a = store.add("  fix login  ").unwrap();
         let b = store.add("write tests").unwrap();
         assert_eq!(a.title, "fix login");
@@ -137,14 +155,14 @@ mod tests {
 
     #[test]
     fn add_rejects_blank_title() {
-        let store = store();
+        let store = TaskStore::in_memory();
         assert!(matches!(store.add("   "), Err(AppError::Invalid(_))));
         assert!(store.list().unwrap().is_empty());
     }
 
     #[test]
     fn toggle_flips_done_and_unknown_id_errors() {
-        let store = store();
+        let store = TaskStore::in_memory();
         let t = store.add("x").unwrap();
         assert!(store.toggle(t.id).unwrap().done);
         assert!(!store.toggle(t.id).unwrap().done);
@@ -153,7 +171,7 @@ mod tests {
 
     #[test]
     fn remove_deletes_and_unknown_id_errors() {
-        let store = store();
+        let store = TaskStore::in_memory();
         let t = store.add("x").unwrap();
         store.remove(t.id).unwrap();
         assert!(store.list().unwrap().is_empty());
@@ -177,7 +195,7 @@ mod tests {
 
     #[test]
     fn titles_with_sql_characters_are_stored_literally() {
-        let store = store();
+        let store = TaskStore::in_memory();
         let nasty = "x'); DROP TABLE tasks; --";
         let t = store.add(nasty).unwrap();
         assert_eq!(t.title, nasty);

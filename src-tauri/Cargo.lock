@@ -2700,6 +2700,7 @@ dependencies = [
 name = "project-jira"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "rusqlite",
  "serde",
  "serde_json",

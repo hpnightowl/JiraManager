@@ -1,6 +1,7 @@
 mod db;
 mod error;
 mod tasks;
+mod timer;
 
 use tasks::TaskStore;
 use tauri::Manager;
@@ -23,6 +24,10 @@ pub fn run() {
             tasks::list_tasks,
             tasks::toggle_task,
             tasks::delete_task,
+            timer::start_timer,
+            timer::stop_timer,
+            timer::heartbeat,
+            timer::stale_timer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
