@@ -13,17 +13,24 @@
     "windows": [
       {
         "title": "ProjectJira",
-        "width": 800,
-        "height": 600
+        "width": 1100,
+        "height": 820,
+        "minWidth": 640,
+        "minHeight": 520
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      "devCsp": "default-src 'self' http://localhost:1420 ws://localhost:1420; script-src 'self' 'unsafe-inline' http://localhost:1420; style-src 'self' 'unsafe-inline' http://localhost:1420; img-src 'self' data: http://localhost:1420; connect-src 'self' ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420; object-src 'none'; base-uri 'none'"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "category": "Productivity",
+    "shortDescription": "Capture tasks, track time and push stories to Jira",
+    "longDescription": "ProjectJira turns the work you do into Jira stories and worklogs. Add tasks as you work, time them, import your GitLab merge requests or local branches, draft stories with a local AI (Ollama), review everything, and push it to Jira only when you confirm.",
+    "copyright": "ProjectJira",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

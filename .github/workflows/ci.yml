@@ -1,0 +1,63 @@
+# Runs on every push and pull request: type check, tests, build, and a vulnerability scan.
+# It never sees signing keys: those exist only in release.yml, behind the "release" environment.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      # Every third-party action is pinned to a full commit SHA (a tag can be moved; a SHA can't).
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Linux libraries for the app window
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+            libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev build-essential pkg-config
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test --locked
+
+  audit:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Known-vulnerable npm packages that ship in the app (build-only tools are not scanned here)
+        run: npm audit --omit=dev --audit-level=moderate
+      - name: Known-vulnerable Rust crates
+        working-directory: src-tauri
+        # The ignored advisories are "unmaintained" notices for libraries inside Tauri's own GTK/keyring
+        # stack that we cannot replace; they are listed in docs/SECURITY.md. Real vulnerabilities fail the build.
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --deny warnings --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2026-0370 --ignore RUSTSEC-2026-0371 \
+            --ignore RUSTSEC-2026-0372 --ignore RUSTSEC-2024-0429

@@ -16,6 +16,29 @@ pub enum AppError {
 
     #[error("internal error: the database lock was poisoned")]
     Poisoned,
+
+    /// Could not reach Jira at all (DNS, offline, timeout, TLS...).
+    #[error("network error: {0}")]
+    Http(#[from] reqwest::Error),
+
+    /// Jira answered, but with an error. The text is already written for the user.
+    #[error("{0}")]
+    Jira(String),
+
+    /// Missing or invalid settings (for example "no Jira URL saved yet").
+    #[error("{0}")]
+    Config(String),
+
+    #[error("could not store the secret: {0}")]
+    Secret(String),
+
+    /// GitLab answered with an error (or couldn't be reached). Written for the user.
+    #[error("{0}")]
+    Gitlab(String),
+
+    /// The local AI server was unreachable or answered badly. Written for the user.
+    #[error("{0}")]
+    Llm(String),
 }
 
 /// Tauri needs command errors to be serializable. The UI only needs the message,

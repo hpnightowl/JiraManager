@@ -8,4 +8,13 @@ node_modules
 !.env.example
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
-/docs
+
+# Never commit signing keys, certificates or stored secrets
+*.pfx
+*.p12
+*.pem
+*.key
+*.asc
+!release-public-key.asc
+secret-*
+*.log
