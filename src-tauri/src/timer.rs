@@ -1,7 +1,5 @@
-//! Start/stop timer. Every method takes the time as a parameter (`now`, `at`) instead of
-//! reading the clock itself. That keeps the logic deterministic, so tests can say
-//! "start at 1000, stop at 1090" without sleeping. Only the Tauri commands at the bottom
-//! read the real clock.
+//! Start/stop timer. Methods take the time as a parameter so tests don't sleep; only the commands
+//! at the bottom read the real clock.
 
 use crate::error::AppError;
 use crate::tasks::TaskStore;
@@ -81,6 +79,19 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Seconds worked inside [from, to): used for the "today" and "this month" totals.
+    /// An entry that straddles the edge only counts the part inside; a running timer counts
+    /// up to `now`. (SQLite's two-argument MIN/MAX are "smaller/larger of these".)
+    pub fn tracked_between(&self, from: i64, to: i64, now: i64) -> Result<i64, AppError> {
+        let conn = self.conn()?;
+        Ok(conn.query_row(
+            "SELECT COALESCE(SUM(MAX(0, MIN(COALESCE(ended_at, ?3), ?2) - MAX(started_at, ?1))), 0)
+             FROM time_entries",
+            params![from, to, now],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Is there a running timer whose heartbeat has gone quiet? (Call once at app start.)
     pub fn stale_timer(&self, now: i64) -> Result<Option<StaleTimer>, AppError> {
         let conn = self.conn()?;
@@ -125,6 +136,12 @@ pub fn stop_timer(at: Option<i64>, store: State<'_, TaskStore>) -> Result<(), Ap
 #[tauri::command]
 pub fn heartbeat(store: State<'_, TaskStore>) -> Result<(), AppError> {
     store.heartbeat(now())
+}
+
+/// The UI passes the start and end of "today" / "this month" in the user's own time zone.
+#[tauri::command]
+pub fn tracked_between(from: i64, to: i64, store: State<'_, TaskStore>) -> Result<i64, AppError> {
+    store.tracked_between(from, to, now())
 }
 
 #[tauri::command]
@@ -187,6 +204,19 @@ mod tests {
         store.start_timer(a.id, 2000).unwrap();
         store.stop_timer(10, 2050).unwrap(); // end before start is clamped to start
         assert_eq!(only_task(&store).tracked_seconds, 100);
+    }
+
+    #[test]
+    fn tracked_between_counts_only_the_part_inside_the_window() {
+        let store = TaskStore::in_memory();
+        let a = store.add("a").unwrap();
+        store.start_timer(a.id, 100).unwrap();
+        store.stop_timer(200, 200).unwrap(); // 100..200
+        store.start_timer(a.id, 300).unwrap(); // running from 300
+        assert_eq!(store.tracked_between(0, 1000, 400).unwrap(), 100 + 100); // second entry up to now=400
+        assert_eq!(store.tracked_between(150, 350, 400).unwrap(), 50 + 50); // clipped on both edges
+        assert_eq!(store.tracked_between(500, 600, 700).unwrap(), 100); // the running entry, clipped to 500..600
+        assert_eq!(store.tracked_between(210, 290, 700).unwrap(), 0); // a gap with no work
     }
 
     #[test]

@@ -1,0 +1,231 @@
+# Builds, signs and drafts a release when a version tag (v0.1.0 ...) is pushed.
+#
+# What protects it:
+#  * it only runs for tags, and only if the tagged commit is on main;
+#  * one-time setup: a "release" environment holding the signing secrets (GPG_PRIVATE_KEY, GPG_PASSPHRASE and
+#    either WINDOWS_CERTIFICATE + WINDOWS_CERTIFICATE_PASSWORD or the AZURE_* secrets);
+#  * the signing keys exist only as secrets of the "release" ENVIRONMENT, which can require your
+#    approval before any job that uses them starts;
+#  * every action is pinned to a commit SHA, installs use the lock files (npm ci, --locked);
+#  * the result is a DRAFT: nothing is public until you read it and press Publish.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+env:
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The tag must be on main and match the version inside the app
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main \
+            || { echo "::error::$TAG is not on the main branch. Releases are only made from reviewed code on main."; exit 1; }
+          version="${TAG#v}"
+          conf=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' src-tauri/tauri.conf.json | head -1)
+          cargo=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' src-tauri/Cargo.toml | head -1)
+          npmv=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' package.json | head -1)
+          echo "tag=$version tauri.conf=$conf Cargo.toml=$cargo package.json=$npmv"
+          [ "$version" = "$conf" ] && [ "$version" = "$cargo" ] && [ "$version" = "$npmv" ] \
+            || { echo "::error::The version in the tag and in tauri.conf.json, Cargo.toml and package.json must all match."; exit 1; }
+
+  build-linux:
+    needs: verify
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Linux libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+            libayatana-appindicator3-dev librsvg2-dev libssl-dev libxdo-dev build-essential pkg-config
+      - run: npm ci
+      - name: Tests before building
+        run: |
+          npm test
+          cd src-tauri && cargo test --locked
+      - name: Build the .deb
+        run: npx tauri build --bundles deb -- --locked
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux
+          path: src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+
+  build-windows:
+    needs: verify
+    runs-on: windows-latest
+    # Holds the Windows signing secrets; a reviewer can be required here (Settings > Environments).
+    environment: release
+    permissions:
+      contents: read
+    env:
+      # Option A: a code-signing certificate as a .pfx file (base64) + its password.
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      # Option B: Azure Artifact Signing (formerly Trusted Signing). No key file at all.
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+      SIGNING_ACCOUNT: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+      SIGNING_PROFILE: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Tests before building
+        shell: pwsh
+        run: |
+          npm test
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Push-Location src-tauri
+          cargo test --locked
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { exit 1 }
+
+      - name: Signing with a certificate file (option A)
+        if: env.WINDOWS_CERTIFICATE != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $pw = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw
+          Remove-Item $pfx -Force
+          $cfg = @{ bundle = @{ windows = @{ certificateThumbprint = $cert.Thumbprint; digestAlgorithm = 'sha256'; timestampUrl = 'http://timestamp.digicert.com' } } } | ConvertTo-Json -Depth 6
+          $path = Join-Path $env:RUNNER_TEMP 'sign.json'
+          Set-Content -Path $path -Value $cfg
+          "SIGN_CONFIG=$path" >> $env:GITHUB_ENV
+
+      - name: Signing with Azure Artifact Signing (option B)
+        if: env.AZURE_CLIENT_ID != '' && env.WINDOWS_CERTIFICATE == ''
+        shell: pwsh
+        run: |
+          cargo install artifact-signing-cli --locked
+          $cmd = "artifact-signing-cli -e $env:SIGNING_ENDPOINT -a $env:SIGNING_ACCOUNT -c $env:SIGNING_PROFILE -d ProjectJira %1"
+          $cfg = @{ bundle = @{ windows = @{ signCommand = $cmd } } } | ConvertTo-Json -Depth 6
+          $path = Join-Path $env:RUNNER_TEMP 'sign.json'
+          Set-Content -Path $path -Value $cfg
+          "SIGN_CONFIG=$path" >> $env:GITHUB_ENV
+
+      - name: Build the installers
+        shell: pwsh
+        run: |
+          $extra = @()
+          if ($env:SIGN_CONFIG) { $extra = @('--config', $env:SIGN_CONFIG) } else { Write-Warning 'No signing secrets found: building UNSIGNED installers.' }
+          npx tauri build --bundles nsis,msi @extra -- --locked
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Check the signature (a signed release must really be signed)
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem src-tauri/target/release/bundle -Recurse -Include *.exe, *.msi
+          if (-not $files) { throw 'No installers were produced.' }
+          $bad = 0
+          foreach ($f in $files) {
+            $s = Get-AuthenticodeSignature $f.FullName
+            "$($f.Name): $($s.Status) $($s.SignerCertificate.Subject)"
+            if ($env:SIGN_CONFIG -and $s.Status -ne 'Valid') { $bad++ }
+          }
+          if ($bad) { throw "$bad installer(s) are not validly signed." }
+          $state = 'unsigned'
+          if ($env:SIGN_CONFIG) { $state = 'signed' }
+          Set-Content -Path (Join-Path $env:RUNNER_TEMP 'signed.txt') -Value $state
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-status
+          path: ${{ runner.temp }}/signed.txt
+
+  publish:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-22.04
+    # The GPG key lives only here. Add a required reviewer to this environment for a manual approval step.
+    environment: release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+      - name: Checksums, signatures and a DRAFT release
+        run: |
+          set -euo pipefail
+          mkdir release
+          cp dist/linux/*.deb dist/windows/*.exe dist/windows/*.msi release/
+          winstate=$(cat dist/windows-status/signed.txt)
+          cd release
+          sha256sum * > SHA256SUMS
+          gpgstate=unsigned
+          if [ -n "${GPG_PRIVATE_KEY:-}" ]; then
+            umask 077
+            printf '%s' "$GPG_PASSPHRASE" > "$RUNNER_TEMP/pp"
+            echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+            for f in *; do
+              gpg --batch --yes --pinentry-mode loopback --passphrase-file "$RUNNER_TEMP/pp" --armor --detach-sign "$f"
+            done
+            rm -f "$RUNNER_TEMP/pp"
+            gpgstate=signed
+          fi
+          {
+            echo "## ProjectJira $TAG"
+            echo
+            echo "| File type | Signature |"
+            echo "|---|---|"
+            echo "| Windows installers (.exe, .msi) | **$winstate** (Authenticode) |"
+            echo "| All files | **GPG $gpgstate**, plus SHA256SUMS |"
+            echo
+            if [ "$winstate" = unsigned ] || [ "$gpgstate" = unsigned ]; then
+              echo "> **Not fully signed.** Do not publish this as an official release until the signing secrets are set up."
+              echo
+            fi
+            echo "### Verify before installing"
+            echo
+            echo "    gpg --import release-public-key.asc"
+            echo "    gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c SHA256SUMS --ignore-missing"
+            echo
+            echo "On Windows: right-click the installer, Properties, Digital Signatures."
+          } > ../notes.md
+          cd ..
+          gh release create "$TAG" --draft --verify-tag --title "ProjectJira $TAG" --notes-file notes.md release/*
