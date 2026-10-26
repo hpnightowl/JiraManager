@@ -1,6 +1,6 @@
 [package]
 name = "project-jira"
-version = "0.1.0"
+version = "0.1.1"
 description = "Capture tasks, track time, push to Jira"
 authors = ["hpnightowl"]
 edition = "2021"

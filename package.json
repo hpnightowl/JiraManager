@@ -1,6 +1,6 @@
 {
   "name": "project-jira",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Track tasks and time and push stories and worklogs to Jira",
   "type": "module",
   "scripts": {
