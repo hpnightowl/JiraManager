@@ -193,7 +193,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir release
-          cp dist/linux/*.deb dist/windows/*.exe dist/windows/*.msi release/
+          mapfile -t assets < <(find dist/linux dist/windows -type f \( -name '*.deb' -o -name '*.exe' -o -name '*.msi' \) | sort)
+          [ "${#assets[@]}" -gt 0 ] || { echo "::error::No release artifacts found."; exit 1; }
+          cp "${assets[@]}" release/
           winstate=$(cat dist/windows-status/signed.txt)
           cd release
           sha256sum * > SHA256SUMS
